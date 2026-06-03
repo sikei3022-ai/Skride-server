@@ -1,0 +1,13 @@
+{
+  "name": "skride-backend",
+  "version": "1.0.0",
+  "description": "Сервер-посредник для приложения Skride: ИИ-тренер и живой голос.",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
