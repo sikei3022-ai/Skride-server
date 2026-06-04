@@ -9,6 +9,9 @@
 // Деплой: Render / Railway / Cloudflare — см. README.md
 
 const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
 const app = express();
 app.use(express.json({ limit: '256kb' }));
 
@@ -18,7 +21,7 @@ app.use(express.json({ limit: '256kb' }));
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -179,8 +182,158 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
-// health-check
-// диагностика синтеза речи — открой /api/voicecheck в браузере
+// ===================== АККАУНТЫ + БАЗА + СИНХРОНИЗАЦИЯ =====================
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const JWT_SECRET = process.env.JWT_SECRET || '';
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+
+async function initDb() {
+  if (!pool) { console.warn('Нет DATABASE_URL — аккаунты выключены'); return; }
+  await pool.query(`CREATE TABLE IF NOT EXISTS users(
+    id serial PRIMARY KEY,
+    email text UNIQUE,
+    pass_hash text,
+    yandex_id text UNIQUE,
+    name text,
+    runs jsonb DEFAULT '[]'::jsonb,
+    week_km double precision DEFAULT 0,
+    total_km double precision DEFAULT 0,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  )`);
+  console.log('База готова');
+}
+initDb().catch(e => console.error('initDb error:', e.message));
+
+function dbReady(res) {
+  if (!pool) { res.status(503).json({ error: 'Аккаунты не настроены на сервере (нет DATABASE_URL)' }); return false; }
+  if (!JWT_SECRET) { res.status(503).json({ error: 'Аккаунты не настроены на сервере (нет JWT_SECRET)' }); return false; }
+  return true;
+}
+function makeToken(u) { return jwt.sign({ uid: u.id }, JWT_SECRET, { expiresIn: '180d' }); }
+function publicUser(u) { return { id: u.id, email: u.email || null, name: u.name || null, yandex: !!u.yandex_id }; }
+async function auth(req, res) {
+  const h = req.headers['authorization'] || '';
+  const tok = h.startsWith('Bearer ') ? h.slice(7) : '';
+  if (!tok) { res.status(401).json({ error: 'Нужен вход' }); return null; }
+  try {
+    const p = jwt.verify(tok, JWT_SECRET);
+    const r = await pool.query('SELECT * FROM users WHERE id=$1', [p.uid]);
+    if (!r.rows[0]) { res.status(401).json({ error: 'Сессия не найдена' }); return null; }
+    return r.rows[0];
+  } catch (e) { res.status(401).json({ error: 'Сессия истекла, войди заново' }); return null; }
+}
+function computeKm(runs) {
+  let total = 0, week = 0; const wk = Date.now() - 7 * 86400000;
+  (Array.isArray(runs) ? runs : []).forEach(r => {
+    const km = +r.km || 0; total += km;
+    const d = r.date ? new Date(r.date + 'T00:00').getTime() : 0;
+    if (d >= wk) week += km;
+  });
+  return { total: Math.round(total * 100) / 100, week: Math.round(week * 100) / 100 };
+}
+const emailRe = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+// --- Регистрация: почта + пароль ---
+app.post('/api/register', async (req, res) => {
+  if (!dbReady(res)) return;
+  try {
+    let { email, password, name } = req.body || {};
+    email = String(email || '').trim().toLowerCase();
+    password = String(password || '');
+    if (!emailRe.test(email)) return res.status(400).json({ error: 'Неверный e-mail' });
+    if (password.length < 6) return res.status(400).json({ error: 'Пароль минимум 6 символов' });
+    const ex = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
+    if (ex.rows[0]) return res.status(409).json({ error: 'Такая почта уже зарегистрирована' });
+    const hash = await bcrypt.hash(password, 10);
+    const r = await pool.query(
+      'INSERT INTO users(email, pass_hash, name) VALUES($1,$2,$3) RETURNING *',
+      [email, hash, String(name || '').slice(0, 40) || null]);
+    const u = r.rows[0];
+    res.json({ token: makeToken(u), user: publicUser(u) });
+  } catch (e) { console.error('register:', e.message); res.status(500).json({ error: 'Ошибка регистрации' }); }
+});
+
+// --- Вход: почта + пароль ---
+app.post('/api/login', async (req, res) => {
+  if (!dbReady(res)) return;
+  try {
+    let { email, password } = req.body || {};
+    email = String(email || '').trim().toLowerCase();
+    password = String(password || '');
+    const r = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+    const u = r.rows[0];
+    if (!u || !u.pass_hash) return res.status(401).json({ error: 'Почта или пароль неверны' });
+    const ok = await bcrypt.compare(password, u.pass_hash);
+    if (!ok) return res.status(401).json({ error: 'Почта или пароль неверны' });
+    res.json({ token: makeToken(u), user: publicUser(u) });
+  } catch (e) { console.error('login:', e.message); res.status(500).json({ error: 'Ошибка входа' }); }
+});
+
+// --- Вход через Яндекс ID (приложение присылает access_token) ---
+app.post('/api/yandex', async (req, res) => {
+  if (!dbReady(res)) return;
+  try {
+    const token = String((req.body && req.body.token) || '');
+    if (!token) return res.status(400).json({ error: 'Нет токена Яндекса' });
+    const yr = await fetch('https://login.yandex.ru/info?format=json', { headers: { 'Authorization': 'OAuth ' + token } });
+    if (!yr.ok) return res.status(401).json({ error: 'Яндекс не подтвердил вход' });
+    const info = await yr.json();
+    const yid = String(info.id || ''); if (!yid) return res.status(401).json({ error: 'Яндекс не вернул профиль' });
+    const yemail = (info.default_email || '').toLowerCase() || null;
+    const yname = info.real_name || info.display_name || info.first_name || null;
+    let r = await pool.query('SELECT * FROM users WHERE yandex_id=$1', [yid]);
+    let u = r.rows[0];
+    if (!u && yemail) {
+      const byMail = await pool.query('SELECT * FROM users WHERE email=$1', [yemail]);
+      if (byMail.rows[0]) { u = (await pool.query('UPDATE users SET yandex_id=$1 WHERE id=$2 RETURNING *', [yid, byMail.rows[0].id])).rows[0]; }
+    }
+    if (!u) { u = (await pool.query('INSERT INTO users(yandex_id, email, name) VALUES($1,$2,$3) RETURNING *', [yid, yemail, yname])).rows[0]; }
+    res.json({ token: makeToken(u), user: publicUser(u) });
+  } catch (e) { console.error('yandex:', e.message); res.status(500).json({ error: 'Ошибка входа через Яндекс' }); }
+});
+
+// --- Кто я ---
+app.get('/api/me', async (req, res) => {
+  if (!dbReady(res)) return; const u = await auth(req, res); if (!u) return;
+  res.json({ user: publicUser(u) });
+});
+
+// --- Получить мои тренировки из облака ---
+app.get('/api/sync', async (req, res) => {
+  if (!dbReady(res)) return; const u = await auth(req, res); if (!u) return;
+  res.json({ runs: u.runs || [], updated_at: u.updated_at });
+});
+
+// --- Сохранить мои тренировки в облако ---
+app.post('/api/sync', async (req, res) => {
+  if (!dbReady(res)) return; const u = await auth(req, res); if (!u) return;
+  try {
+    let runs = (req.body && req.body.runs) || [];
+    if (!Array.isArray(runs)) runs = [];
+    runs = runs.slice(0, 5000);
+    const km = computeKm(runs);
+    await pool.query('UPDATE users SET runs=$1, week_km=$2, total_km=$3, updated_at=now() WHERE id=$4',
+      [JSON.stringify(runs), km.week, km.total, u.id]);
+    res.json({ ok: true, count: runs.length, week_km: km.week, total_km: km.total });
+  } catch (e) { console.error('sync:', e.message); res.status(500).json({ error: 'Ошибка синхронизации' }); }
+});
+
+// --- Анонимный рейтинг среди пользователей (по недельному объёму) ---
+app.get('/api/rank', async (req, res) => {
+  if (!dbReady(res)) return; const u = await auth(req, res); if (!u) return;
+  try {
+    const totalR = await pool.query('SELECT count(*)::int AS n FROM users WHERE total_km > 0');
+    const total = Math.max(1, totalR.rows[0].n);
+    const my = +u.week_km || 0;
+    const ahead = await pool.query('SELECT count(*)::int AS n FROM users WHERE week_km > $1', [my]);
+    const position = ahead.rows[0].n + 1;
+    const better = total > 1 ? Math.round((total - position) / (total - 1) * 100) : 50;
+    res.json({ position, total, percentile: Math.max(0, Math.min(100, better)), week_km: my });
+  } catch (e) { console.error('rank:', e.message); res.status(500).json({ error: 'Ошибка рейтинга' }); }
+});
+
+
 app.get('/api/voicecheck', async (req, res) => {
   try {
     if (!YANDEX_TTS_KEY) return res.json({ ok: false, where: 'config', error: 'нет ключа YANDEX_API_KEY' });
@@ -201,9 +354,10 @@ app.get('/api/voicecheck', async (req, res) => {
 app.get('/', (req, res) => res.json({
   ok: true,
   service: 'Skride backend',
-  version: '4.1-voicecheck',
+  version: '5.0-accounts',
   llm: LLM_PROVIDER,
-  voice: ELEVENLABS_API_KEY ? 'elevenlabs' : (YANDEX_TTS_KEY ? 'yandex' : 'none')
+  voice: ELEVENLABS_API_KEY ? 'elevenlabs' : (YANDEX_TTS_KEY ? 'yandex' : 'none'),
+  accounts: !!(pool && JWT_SECRET)
 }));
 
 const PORT = process.env.PORT || 3000;
