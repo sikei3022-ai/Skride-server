@@ -144,6 +144,7 @@ app.post('/api/tts', async (req, res) => {
   try {
     const text = String((req.body && req.body.text) || '').slice(0, 800);
     if (!text) return res.status(400).json({ error: 'text required' });
+    const voice = (req.body && req.body.voice) ? String(req.body.voice).slice(0, 30) : YANDEX_VOICE;
 
     if (ELEVENLABS_API_KEY) {
       const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + ELEVEN_VOICE_ID, {
@@ -158,7 +159,7 @@ app.post('/api/tts', async (req, res) => {
     }
 
     if (YANDEX_TTS_KEY) {
-      const params = new URLSearchParams({ text, lang: 'ru-RU', voice: YANDEX_VOICE, format: 'oggopus', speed: '1.0' });
+      const params = new URLSearchParams({ text, lang: 'ru-RU', voice: voice, format: 'oggopus', speed: '1.0' });
       if (YANDEX_FOLDER_ID) params.set('folderId', YANDEX_FOLDER_ID);
       const r = await fetch('https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize', {
         method: 'POST',
