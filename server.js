@@ -183,6 +183,7 @@ app.post('/api/tts', async (req, res) => {
 app.get('/', (req, res) => res.json({
   ok: true,
   service: 'Skride backend',
+  version: '4.1-voice',
   llm: LLM_PROVIDER,
   voice: ELEVENLABS_API_KEY ? 'elevenlabs' : (YANDEX_TTS_KEY ? 'yandex' : 'none')
 }));
