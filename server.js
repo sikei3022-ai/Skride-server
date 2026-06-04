@@ -180,10 +180,28 @@ app.post('/api/tts', async (req, res) => {
 });
 
 // health-check
+// диагностика синтеза речи — открой /api/voicecheck в браузере
+app.get('/api/voicecheck', async (req, res) => {
+  try {
+    if (!YANDEX_TTS_KEY) return res.json({ ok: false, where: 'config', error: 'нет ключа YANDEX_API_KEY' });
+    const v = (req.query.voice ? String(req.query.voice) : YANDEX_VOICE);
+    const params = new URLSearchParams({ text: 'тест', lang: 'ru-RU', voice: v, format: 'oggopus' });
+    if (YANDEX_FOLDER_ID) params.set('folderId', YANDEX_FOLDER_ID);
+    const r = await fetch('https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize', {
+      method: 'POST',
+      headers: { 'Authorization': 'Api-Key ' + YANDEX_TTS_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    if (!r.ok) { const t = await r.text(); return res.json({ ok: false, where: 'yandex', status: r.status, voice: v, error: t.slice(0, 300) }); }
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.json({ ok: true, voice: v, bytes: buf.length });
+  } catch (e) { res.json({ ok: false, where: 'exception', error: String(e.message) }); }
+});
+
 app.get('/', (req, res) => res.json({
   ok: true,
   service: 'Skride backend',
-  version: '4.1-voice',
+  version: '4.1-voicecheck',
   llm: LLM_PROVIDER,
   voice: ELEVENLABS_API_KEY ? 'elevenlabs' : (YANDEX_TTS_KEY ? 'yandex' : 'none')
 }));
