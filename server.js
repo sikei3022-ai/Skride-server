@@ -13,7 +13,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const app = express();
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '6mb' }));  // увеличено для фото табло (OCR)
 
 // ---- CORS (разрешаем запросы из приложения) ----
 // По умолчанию разрешаем всем (*). Для безопасности можно вписать свой домен
@@ -351,13 +351,83 @@ app.get('/api/voicecheck', async (req, res) => {
   } catch (e) { res.json({ ok: false, where: 'exception', error: String(e.message) }); }
 });
 
+
+// ===================== РАСПОЗНАВАНИЕ ТАБЛО ТРЕНАЖЁРА (Yandex Vision OCR) =====================
+// Принимает фото дисплея дорожки/эллипса/велотренажёра, распознаёт текст,
+// вытягивает дистанцию (км) и время. Возвращает { km, sec, raw } для подстановки в форму.
+function parseBoard(text){
+  const t = String(text || '');
+  // ВРЕМЯ: HH:MM:SS или MM:SS — берём самое большое правдоподобное (время тренировки длиннее темпа)
+  let sec = null, best = -1;
+  const re = /(\d{1,2}):(\d{2})(?::(\d{2}))?/g; let m;
+  while ((m = re.exec(t))) {
+    const mm = +m[2], ss = m[3] !== undefined ? +m[3] : 0;
+    if (mm > 59 || ss > 59) continue;
+    const total = m[3] !== undefined ? (+m[1]) * 3600 + mm * 60 + ss : (+m[1]) * 60 + mm;
+    if (total > best) { best = total; sec = total; }
+  }
+  // ДИСТАНЦИЯ: десятичное число рядом с km/км, иначе первое правдоподобное десятичное
+  let km = null;
+  let mm2 = t.match(/(\d{1,3}[.,]\d{1,2})\s*(?:km|км)/i)
+        || t.match(/(?:dist[a-zа-я]*|дист[а-я]*)\D{0,10}(\d{1,3}[.,]\d{1,2})/i);
+  if (mm2) km = parseFloat(mm2[1].replace(',', '.'));
+  if (km == null) {
+    const decs = [...t.matchAll(/(\d{1,3}[.,]\d{1,2})/g)]
+      .map(x => parseFloat(x[1].replace(',', '.')))
+      .filter(v => v >= 0.1 && v <= 300);
+    if (decs.length) km = decs[0];
+  }
+  return {
+    km: (km != null && isFinite(km)) ? +km.toFixed(2) : null,
+    sec: (sec != null && sec > 0) ? sec : null
+  };
+}
+
+app.post('/api/ocr', async (req, res) => {
+  try {
+    if (!YANDEX_API_KEY) return res.status(400).json({ error: 'Нет YANDEX_API_KEY' });
+    if (!YANDEX_FOLDER_ID) return res.status(400).json({ error: 'Нет YANDEX_FOLDER_ID' });
+    let img = (req.body && req.body.image) || '';
+    if (!img) return res.status(400).json({ error: 'Нет изображения' });
+    let mime = 'image/jpeg';
+    if (img.startsWith('data:')) {
+      const mh = img.match(/^data:([^;]+)/); if (mh) mime = mh[1];
+      const c = img.indexOf(','); if (c >= 0) img = img.slice(c + 1);
+    }
+    if (!/^image\/(jpeg|png)$/.test(mime)) mime = 'image/jpeg';
+    const r = await fetch('https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Api-Key ' + YANDEX_API_KEY,
+        'x-folder-id': YANDEX_FOLDER_ID,
+        'x-data-logging-enabled': 'false'
+      },
+      body: JSON.stringify({ mimeType: mime, languageCodes: ['ru', 'en'], model: 'page', content: img })
+    });
+    if (!r.ok) {
+      const tx = await r.text();
+      console.error('ocr yandex:', r.status, tx.slice(0, 200));
+      return res.status(502).json({ error: 'OCR ' + r.status, detail: tx.slice(0, 300) });
+    }
+    const j = await r.json();
+    const full = (j.result && j.result.textAnnotation && j.result.textAnnotation.fullText) || '';
+    const parsed = parseBoard(full);
+    res.json({ km: parsed.km, sec: parsed.sec, raw: full.slice(0, 400) });
+  } catch (e) {
+    console.error('ocr:', e.message);
+    res.status(500).json({ error: 'Ошибка распознавания' });
+  }
+});
+
 app.get('/', (req, res) => res.json({
   ok: true,
   service: 'Skride backend',
-  version: '5.0-accounts',
+  version: '6.0-ocr',
   llm: LLM_PROVIDER,
   voice: ELEVENLABS_API_KEY ? 'elevenlabs' : (YANDEX_TTS_KEY ? 'yandex' : 'none'),
-  accounts: !!(pool && JWT_SECRET)
+  accounts: !!(pool && JWT_SECRET),
+  ocr: !!(YANDEX_API_KEY && YANDEX_FOLDER_ID)
 }));
 
 const PORT = process.env.PORT || 3000;
